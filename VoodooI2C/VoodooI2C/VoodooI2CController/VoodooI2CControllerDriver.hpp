@@ -150,6 +150,12 @@ class EXPORT VoodooI2CControllerDriver : public IOService {
     IOWorkLoop* work_loop = nullptr;
     IOLock* i2c_bus_lock = nullptr;
     bool is_interrupt_registered = false;
+    bool host_polling = false;
+    UInt32 host_poll_mask = 0;
+
+    void setTransferInterruptMask(UInt32 mask);
+    bool serviceTransfer(UInt32 status);
+    IOReturn waitForTransfer(AbsoluteTime deadline);
 
     /* Request a 32-bit value property from this service or any parent in the
      * IOService tree.
@@ -227,7 +233,7 @@ class EXPORT VoodooI2CControllerDriver : public IOService {
      * @return *DW_IC_INT* status code
      */
 
-    UInt32 readClearInterruptBits();
+    UInt32 readClearInterruptBits(UInt32 status);
 
     /* Reads an I2C message from the bus
      *

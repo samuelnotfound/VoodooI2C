@@ -6,6 +6,7 @@
 //  Copyright © 2017 Alexandre Daoud. All rights reserved.
 //
 #include <libkern/OSDebug.h>
+#include <mach/mach_time.h>
 
 #include "VoodooI2CControllerDriver.hpp"
 #include "VoodooI2CController.hpp"
@@ -246,15 +247,28 @@ void VoodooI2CControllerDriver::handleInterrupt(OSObject* target, void* refCon, 
     if (!enabled || !(status &~DW_IC_INTR_ACTIVITY) || status == 0xFFFFFFFF)
         goto exit;
 
-    status = readClearInterruptBits();
+    if (serviceTransfer(readRegister(DW_IC_INTR_STAT))) {
+        command_gate->commandWakeup(&bus_device.command_complete);
+    } else if (bus_device.access_intr_mask_workaround) {
+        /* Workaround for triggering a pending hardware interrupt. */
+        status = readRegister(DW_IC_INTR_MASK);
+        writeRegister(0, DW_IC_INTR_MASK);
+        writeRegister(status, DW_IC_INTR_MASK);
+    }
 
+exit:
+    nub->enableInterrupt(0);
+}
+
+bool VoodooI2CControllerDriver::serviceTransfer(UInt32 status) {
+    status = readClearInterruptBits(status);
     if (status & DW_IC_INTR_TX_ABRT) {
         bus_device.command_error |= DW_IC_ERR_TX_ABRT;
         bus_device.status = STATUS_IDLE;
         bus_device.receive_outstanding = 0;
 
-        writeRegister(0, DW_IC_INTR_MASK);
-        goto wakeup;
+        setTransferInterruptMask(0);
+        return true;
     }
 
     if (status & DW_IC_INTR_RX_FULL)
@@ -263,18 +277,8 @@ void VoodooI2CControllerDriver::handleInterrupt(OSObject* target, void* refCon, 
     if (status & DW_IC_INTR_TX_EMPTY)
         transferMessageToBus();
 
-wakeup:
-    if (((status & (DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET)) || bus_device.message_error) && (bus_device.receive_outstanding == 0)) {
-        command_gate->commandWakeup(&bus_device.command_complete);
-    } else if (bus_device.access_intr_mask_workaround) {
-        /* Workaround to trigger pending interrupt */
-        status = readRegister(DW_IC_INTR_MASK);
-        writeRegister(0, DW_IC_INTR_MASK);
-        writeRegister(status, DW_IC_INTR_MASK);
-    }
-
-exit:
-    nub->enableInterrupt(0);
+    return ((status & DW_IC_INTR_STOP_DET) || bus_device.message_error) &&
+           bus_device.receive_outstanding == 0;
 }
 
 bool VoodooI2CControllerDriver::init(OSDictionary* properties) {
@@ -307,6 +311,31 @@ IOReturn VoodooI2CControllerDriver::initialiseBus() {
     return kIOReturnSuccess;
 }
 
+IOReturn VoodooI2CControllerDriver::waitForTransfer(AbsoluteTime deadline) {
+    if (!host_polling)
+        return command_gate->commandSleep(&bus_device.command_complete, deadline, THREAD_INTERRUPTIBLE);
+
+    // commandSleep releases the work-loop gate between polls. The bus lock still
+    // serializes transfers and power-state changes.
+    while (mach_absolute_time() < deadline) {
+        UInt32 status = readRegister(DW_IC_RAW_INTR_STAT);
+        if (status == 0xFFFFFFFF) {
+            bus_device.message_error = kIOReturnNotReady;
+            return THREAD_AWAKENED;
+        }
+        if (serviceTransfer(status & host_poll_mask))
+            return THREAD_AWAKENED;
+
+        AbsoluteTime next_poll;
+        clock_interval_to_deadline(100, kMicrosecondScale, &next_poll);
+        IOReturn wait = command_gate->commandSleep(&bus_device.command_complete,
+            next_poll < deadline ? next_poll : deadline, THREAD_INTERRUPTIBLE);
+        if (wait != THREAD_TIMED_OUT && wait != THREAD_AWAKENED)
+            return wait;
+    }
+    return THREAD_TIMED_OUT;
+}
+
 IOReturn VoodooI2CControllerDriver::prepareTransferI2C(VoodooI2CControllerBusMessage* messages, int* number) {
     AbsoluteTime abstime, deadline;
     IOReturn sleep;
@@ -334,7 +363,11 @@ IOReturn VoodooI2CControllerDriver::prepareTransferI2C(VoodooI2CControllerBusMes
      */
     nanoseconds_to_absolutetime(1000000000, &abstime);
     clock_absolutetime_interval_to_deadline(abstime, &deadline);
-    sleep = command_gate->commandSleep(&bus_device.command_complete, deadline, THREAD_INTERRUPTIBLE);
+    sleep = waitForTransfer(deadline);
+    if (host_polling && sleep != THREAD_AWAKENED && sleep != THREAD_TIMED_OUT) {
+        initialiseBus();
+        return kIOReturnAborted;
+    }
 
     if (sleep == THREAD_TIMED_OUT) {
         IOLog("%s::%s Timeout waiting for bus to accept transfer request\n", getName(), bus_device.name);
@@ -430,10 +463,7 @@ IOReturn VoodooI2CControllerDriver::publishNubs() {
     return kIOReturnSuccess;
 }
 
-UInt32 VoodooI2CControllerDriver::readClearInterruptBits() {
-    UInt32 stat;
-    stat = readRegister(DW_IC_INTR_STAT);
-
+UInt32 VoodooI2CControllerDriver::readClearInterruptBits(UInt32 stat) {
     if (stat & DW_IC_INTR_RX_UNDER)
         readRegister(DW_IC_CLR_RX_UNDER);
     if (stat & DW_IC_INTR_RX_OVER)
@@ -595,6 +625,7 @@ IOReturn VoodooI2CControllerDriver::setPowerState(unsigned long whichState, IOSe
 bool VoodooI2CControllerDriver::start(IOService* provider) {
     if (!super::start(provider))
         return false;
+    IOReturn host_result;
     i2c_bus_lock = IOLockAlloc();
     if (!i2c_bus_lock) {
         IOLog("%s::%s Could not allocate I2C bus lock\n", getName(), bus_device.name);
@@ -647,9 +678,11 @@ bool VoodooI2CControllerDriver::start(IOService* provider) {
 
     toggleInterrupts(kVoodooI2CStateOff);
 
-    if (startI2CInterrupt() != kIOReturnSuccess) {
+    IOLockLock(i2c_bus_lock);
+    host_result = startI2CInterrupt();
+    IOLockUnlock(i2c_bus_lock);
+    if (host_result != kIOReturnSuccess)
         goto exit;
-    }
 
     setProperty("VoodooI2CServices Supported", kOSBooleanTrue);
 
@@ -703,12 +736,19 @@ IOReturn VoodooI2CControllerDriver::toggleBusState(VoodooI2CState enabled) {
     return kIOReturnTimeout;
 }
 
+void VoodooI2CControllerDriver::setTransferInterruptMask(UInt32 mask) {
+    if (host_polling)
+        host_poll_mask = mask;
+    else
+        writeRegister(mask, DW_IC_INTR_MASK);
+}
+
 void VoodooI2CControllerDriver::toggleInterrupts(VoodooI2CState enabled) {
     if (!enabled) {
-        writeRegister(0, DW_IC_INTR_MASK);
+        setTransferInterruptMask(0);
     } else {
         readRegister(DW_IC_CLR_INTR);
-        writeRegister(DW_IC_INTR_DEFAULT_MASK, DW_IC_INTR_MASK);
+        setTransferInterruptMask(DW_IC_INTR_DEFAULT_MASK);
     }
 }
 
@@ -830,7 +870,7 @@ void VoodooI2CControllerDriver::transferMessageToBus() {
         interrupt_mask = 0;
     }
 
-    writeRegister(interrupt_mask, DW_IC_INTR_MASK);
+    setTransferInterruptMask(interrupt_mask);
 }
 
 IOReturn VoodooI2CControllerDriver::waitBusNotBusyI2C() {
@@ -852,17 +892,33 @@ IOReturn VoodooI2CControllerDriver::waitBusNotBusyI2C() {
 }
 
 IOReturn VoodooI2CControllerDriver::startI2CInterrupt() {
-    if (is_interrupt_registered) {
-        return kIOReturnStillOpen;
-    }
+    if (host_polling)
+        return kIOReturnSuccess;
+
+    auto* pci = nub->controller->physical_device.pci_device;
+    // Intel I2C1 at 00:15.1 on the ASUS X1605VA.
+    bool allow_polling = pci && pci->getBusNumber() == 0 &&
+                         pci->getDeviceNumber() == 0x15 && pci->getFunctionNumber() == 1 &&
+                         pci->configRead32(kIOPCIConfigVendorID) == 0x51E98086 &&
+                         pci->configRead32(kIOPCIConfigSubSystemVendorID) == 0x17431043;
+    if (is_interrupt_registered)
+        return allow_polling ? kIOReturnSuccess : kIOReturnStillOpen;
+
     IOReturn ret = nub->registerInterrupt(0, this, OSMemberFunctionCast(IOInterruptAction, this, &VoodooI2CControllerDriver::handleInterrupt), 0);
     if (ret == kIOReturnSuccess) {
         nub->enableInterrupt(0);
         is_interrupt_registered = true;
+    } else if (allow_polling) {
+        writeRegister(0, DW_IC_INTR_MASK);
+        host_polling = true;
     } else {
         IOLog("%s::%s::Could not register I2C interrupt\n", getName(), bus_device.name);
     }
-    return ret;
+    if (allow_polling) {
+        pci->setProperty("X1605VA-I2C1-IRQ-Result", static_cast<UInt32>(ret), 32);
+        pci->setProperty("X1605VA-I2C1-Host-Mode", host_polling ? "polling" : "interrupt");
+    }
+    return host_polling ? kIOReturnSuccess : ret;
 }
 
 void VoodooI2CControllerDriver::stopI2CInterrupt() {
